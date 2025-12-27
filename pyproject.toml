@@ -1,0 +1,18 @@
+[project]
+name = "gradevsppo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.4.2",
+    "modal>=1.3.0.post1",
+    "pandas>=2.3.3",
+    "peft>=0.18.0",
+    "scipy>=1.16.3",
+    "seaborn>=0.13.2",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.3",
+    "wandb>=0.23.1",
+]
