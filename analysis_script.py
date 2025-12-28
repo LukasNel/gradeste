@@ -542,7 +542,7 @@ def compute_all_metrics(results: dict) -> dict:
                     m[f'steps_to_{int(target*100)}'] = None
         
         # Gradient statistics
-        if 'grad_norm_mean' in data:
+        if 'grad_norm_mean' in data and 'grad_norm_std' in data:
             m['grad_norm_mean'] = np.mean(data['grad_norm_mean'])
             m['grad_norm_std'] = np.mean(data['grad_norm_std'])
             m['grad_norm_max'] = np.max(data['grad_norm_mean'])

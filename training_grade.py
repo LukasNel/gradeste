@@ -32,7 +32,8 @@ class Config:
     # Model
     base_model: str = "EleutherAI/pythia-410m"
     
-    # LoRA
+    # LoRA (optional)
+    use_lora: bool = False
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -51,7 +52,7 @@ class Config:
     # Gumbel-Softmax specific
     tau_start: float = 2.0
     tau_end: float = 0.5
-    tau_anneal_steps: int = 1000
+    tau_anneal_steps: int = 2000
     
     # PPO specific
     ppo_epochs: int = 4
@@ -452,8 +453,7 @@ class PPOTrainer:
         return advantages, returns
     
     def step(self, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor) -> dict:
-        device = self.config.device
-        
+        # Generate responses (no grad)
         with torch.no_grad():
             response_ids = self.policy.generate(
                 prompt_ids, attention_mask=prompt_mask,
@@ -465,37 +465,53 @@ class PPOTrainer:
         
         response_mask = (response_ids != self.tokenizer.pad_token_id).long()
         prompt_len = prompt_ids.shape[1]
-        
-        rewards = self.reward_model.forward_hard(response_ids, response_mask)
-        
-        outputs = self.policy(response_ids, attention_mask=response_mask, output_hidden_states=True)
-        logits = outputs.logits[:, prompt_len-1:-1, :]
         gen_tokens = response_ids[:, prompt_len:]
+        gen_mask = (gen_tokens != self.tokenizer.pad_token_id).float()
         
-        log_probs = F.log_softmax(logits, dim=-1)
-        token_log_probs = log_probs.gather(-1, gen_tokens.unsqueeze(-1)).squeeze(-1)
-        
-        hidden_states = outputs.hidden_states[-1][:, prompt_len-1:-1, :]
-        values = self.value_head(hidden_states).squeeze(-1)
-        
+        # Get rewards
         with torch.no_grad():
+            rewards = self.reward_model.forward_hard(response_ids, response_mask)
+        
+        # Compute old log probs and values (detached - these are the "old" policy)
+        with torch.no_grad():
+            old_outputs = self.policy(response_ids, attention_mask=response_mask, output_hidden_states=True)
+            old_logits = old_outputs.logits[:, prompt_len-1:-1, :]
+            old_log_probs = F.log_softmax(old_logits, dim=-1)
+            old_token_log_probs = old_log_probs.gather(-1, gen_tokens.unsqueeze(-1)).squeeze(-1)
+            
+            old_hidden = old_outputs.hidden_states[-1][:, prompt_len-1:-1, :]
+            old_values = self.value_head(old_hidden).squeeze(-1)
+            
+            # Reference model for KL
             ref_outputs = self.ref_policy(response_ids, attention_mask=response_mask)
             ref_logits = ref_outputs.logits[:, prompt_len-1:-1, :]
             ref_log_probs = F.log_softmax(ref_logits, dim=-1)
             ref_token_log_probs = ref_log_probs.gather(-1, gen_tokens.unsqueeze(-1)).squeeze(-1)
         
-        kl = token_log_probs - ref_token_log_probs
+        # Proper per-token KL: log(π/π_ref) weighted by mask, then mean
+        # For reporting, we use the mean log-ratio (approximates KL for on-policy samples)
+        log_ratio_kl = old_token_log_probs - ref_token_log_probs
+        kl_per_seq = (log_ratio_kl * gen_mask).sum(dim=1) / gen_mask.sum(dim=1).clamp(min=1)
         
-        token_rewards = torch.zeros_like(token_log_probs)
-        token_rewards[:, -1] = rewards - self.config.kl_coef * kl.sum(dim=1)
+        # Token-level rewards: sparse (only at end) with KL penalty
+        token_rewards = torch.zeros_like(old_token_log_probs)
+        token_rewards[:, -1] = rewards - self.config.kl_coef * kl_per_seq
         
-        gen_mask = (gen_tokens != self.tokenizer.pad_token_id).float()
-        advantages, returns = self.compute_advantages(token_rewards.detach(), values.detach(), gen_mask)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # GAE for advantages
+        advantages, returns = self.compute_advantages(token_rewards, old_values, gen_mask)
+        
+        # Normalize advantages
+        adv_mean = (advantages * gen_mask).sum() / gen_mask.sum().clamp(min=1)
+        adv_std = ((advantages - adv_mean).pow(2) * gen_mask).sum() / gen_mask.sum().clamp(min=1)
+        advantages = (advantages - adv_mean) / (adv_std.sqrt() + 1e-8)
         
         total_loss = 0
+        total_policy_loss = 0
+        total_value_loss = 0
         all_grad_norms = []
+        
         for _ in range(self.config.ppo_epochs):
+            # Forward pass with gradients
             outputs = self.policy(response_ids, attention_mask=response_mask, output_hidden_states=True)
             new_logits = outputs.logits[:, prompt_len-1:-1, :]
             new_log_probs = F.log_softmax(new_logits, dim=-1)
@@ -504,24 +520,23 @@ class PPOTrainer:
             new_hidden = outputs.hidden_states[-1][:, prompt_len-1:-1, :]
             new_values = self.value_head(new_hidden).squeeze(-1)
             
-            # Clamp log ratio to prevent exp() explosion
-            log_ratio = new_token_log_probs - token_log_probs.detach()
-            log_ratio = torch.clamp(log_ratio, -20.0, 20.0)  # Prevent extreme ratios
+            # Policy loss with clipped ratio
+            log_ratio = new_token_log_probs - old_token_log_probs
+            log_ratio = torch.clamp(log_ratio, -2.0, 2.0)  # Tighter clamp
             ratio = torch.exp(log_ratio)
             
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
+            policy_loss = -((torch.min(surr1, surr2) * gen_mask).sum() / gen_mask.sum().clamp(min=1))
             
-            # Clipped value loss (PPO-style)
-            value_clipped = values.detach() + torch.clamp(
-                new_values - values.detach(), -self.config.ppo_clip, self.config.ppo_clip
-            )
-            value_loss1 = (new_values - returns) ** 2
-            value_loss2 = (value_clipped - returns) ** 2
-            value_loss = 0.5 * torch.max(value_loss1, value_loss2).mean()
+            # Value loss (simple MSE, no clipping - more stable)
+            value_loss = ((new_values - returns).pow(2) * gen_mask).sum() / gen_mask.sum().clamp(min=1)
             
-            entropy = -(new_log_probs.exp() * new_log_probs).sum(dim=-1).mean()
+            # Entropy bonus (only over generated tokens, not full vocab)
+            # Use negative entropy of the action distribution at each step
+            new_probs = new_log_probs.exp()
+            entropy_per_token = -(new_probs * new_log_probs).sum(dim=-1)  # Per position
+            entropy = (entropy_per_token * gen_mask).sum() / gen_mask.sum().clamp(min=1)
             
             loss = policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
             
@@ -541,13 +556,16 @@ class PPOTrainer:
             self.optimizer.step()
             
             total_loss += loss.item()
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
         
         return {
             "loss": total_loss / self.config.ppo_epochs, 
+            "policy_loss": total_policy_loss / self.config.ppo_epochs,
+            "value_loss": total_value_loss / self.config.ppo_epochs,
             "reward": rewards.mean().item(), 
-            "kl": kl.mean().item(),
+            "kl": kl_per_seq.mean().item(),
             "grad_norm_mean": np.mean(all_grad_norms) if all_grad_norms else 0,
-            "grad_norm_std": np.std(all_grad_norms) if all_grad_norms else 0,
         }
 
 
@@ -643,39 +661,55 @@ class REINFORCETrainer:
         self.baseline_momentum = 0.9
     
     def step(self, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor) -> dict:
-        response_ids = self.policy.generate(
-            prompt_ids, attention_mask=prompt_mask,
-            max_new_tokens=self.config.max_new_tokens, min_new_tokens=self.config.min_new_tokens,
-            do_sample=True, top_p=0.9, pad_token_id=self.tokenizer.pad_token_id,
-        )
+        # Generate responses (no grad needed for generation)
+        with torch.no_grad():
+            response_ids = self.policy.generate(
+                prompt_ids, attention_mask=prompt_mask,
+                max_new_tokens=self.config.max_new_tokens, min_new_tokens=self.config.min_new_tokens,
+                do_sample=True, top_p=0.9, pad_token_id=self.tokenizer.pad_token_id,
+            )
         
         response_mask = (response_ids != self.tokenizer.pad_token_id).long()
         prompt_len = prompt_ids.shape[1]
+        gen_tokens = response_ids[:, prompt_len:]
+        gen_mask = (gen_tokens != self.tokenizer.pad_token_id).float()
+        seq_lengths = gen_mask.sum(dim=1).clamp(min=1)
         
+        # Get rewards (no grad)
         with torch.no_grad():
             rewards = self.reward_model.forward_hard(response_ids, response_mask)
         
+        # Compute log probs for policy gradient
         outputs = self.policy(response_ids, attention_mask=response_mask)
         logits = outputs.logits[:, prompt_len-1:-1, :]
-        gen_tokens = response_ids[:, prompt_len:]
-        
         log_probs = F.log_softmax(logits, dim=-1)
         token_log_probs = log_probs.gather(-1, gen_tokens.unsqueeze(-1)).squeeze(-1)
-        gen_mask = (gen_tokens != self.tokenizer.pad_token_id).float()
-        seq_log_probs = (token_log_probs * gen_mask).sum(dim=1)
         
+        # Mean log prob per sequence (normalized by length)
+        seq_log_probs = (token_log_probs * gen_mask).sum(dim=1) / seq_lengths
+        
+        # Compute KL with reference model (no grad, for penalty only)
         with torch.no_grad():
             ref_outputs = self.ref_policy(response_ids, attention_mask=response_mask)
             ref_logits = ref_outputs.logits[:, prompt_len-1:-1, :]
             ref_log_probs = F.log_softmax(ref_logits, dim=-1)
             ref_token_log_probs = ref_log_probs.gather(-1, gen_tokens.unsqueeze(-1)).squeeze(-1)
+            
+            # KL per sequence, normalized by length
+            kl_per_token = token_log_probs - ref_token_log_probs
+            kl_per_seq = (kl_per_token * gen_mask).sum(dim=1) / seq_lengths
         
-        kl = ((token_log_probs - ref_token_log_probs) * gen_mask).sum(dim=1)
+        # Advantage = reward - KL penalty - baseline
+        with torch.no_grad():
+            adjusted_rewards = rewards - self.config.kl_coef * kl_per_seq
+            advantage = adjusted_rewards - self.baseline
+            # Normalize advantage for stability
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
         
-        adjusted_rewards = rewards - self.config.kl_coef * kl
-        advantage = adjusted_rewards - self.baseline
-        loss = -(seq_log_probs * advantage.detach()).mean()
+        # REINFORCE loss: -log_prob * advantage
+        loss = -(seq_log_probs * advantage).mean()
         
+        # Update baseline with exponential moving average of raw rewards
         self.baseline = self.baseline_momentum * self.baseline + (1 - self.baseline_momentum) * rewards.mean().item()
         
         self.optimizer.zero_grad()
@@ -687,7 +721,7 @@ class REINFORCETrainer:
         self.optimizer.step()
         
         return {
-            "loss": loss.item(), "reward": rewards.mean().item(), "kl": kl.mean().item(),
+            "loss": loss.item(), "reward": rewards.mean().item(), "kl": kl_per_seq.mean().item(),
             "grad_norm_mean": np.mean(grad_norms) if grad_norms else 0,
             "grad_norm_std": np.std(grad_norms) if grad_norms else 0,
         }
@@ -775,24 +809,29 @@ def train_method(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # Required for decoder-only models
     
-    # Load model with LoRA
+    # Load model
     base_model = AutoModelForCausalLM.from_pretrained(config.base_model, torch_dtype=torch.float32).to(config.device)
     
-    if "pythia" in config.base_model.lower():
-        target_modules = ["query_key_value"]
-    elif "gpt2" in config.base_model.lower():
-        target_modules = ["c_attn", "c_proj"]
+    if config.use_lora:
+        if "pythia" in config.base_model.lower():
+            target_modules = ["query_key_value"]
+        elif "gpt2" in config.base_model.lower():
+            target_modules = ["c_attn", "c_proj"]
+        else:
+            target_modules = ["c_attn"]
+        
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM, r=config.lora_r,
+            lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout,
+            target_modules=target_modules,
+        )
+        policy = get_peft_model(base_model, lora_config)
+        policy.print_trainable_parameters()
     else:
-        target_modules = ["c_attn"]
-    
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM, r=config.lora_r,
-        lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout,
-        target_modules=target_modules,
-    )
-    
-    policy = get_peft_model(base_model, lora_config)
-    policy.print_trainable_parameters()
+        policy = base_model
+        trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in policy.parameters())
+        print(f"trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.2f}")
     
     ref_model = AutoModelForCausalLM.from_pretrained(config.base_model, torch_dtype=torch.float32).to(config.device)
     ref_model.eval()
@@ -919,7 +958,7 @@ def train_method(
 class Arguments:
     method: str = "all"
     base_model: str = "openai-community/gpt2-medium"
-    max_steps: int = 2000
+    max_steps: int = 1000
     batch_size: int = 4
     learning_rate: float = 1e-4
     wandb_project: str = "grade-vs-ppo"
