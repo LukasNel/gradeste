@@ -15,7 +15,7 @@ def train_reward_model():
     from analysis_script import main as analysis_script_main
     import os
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    main(output_dir=OUTPUT_DIR)
+    # main(output_dir=OUTPUT_DIR)
     analysis_script_main(results_dir=OUTPUT_DIR, eval_every=100)
 
 

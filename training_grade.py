@@ -494,6 +494,7 @@ class PPOTrainer:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         total_loss = 0
+        all_grad_norms = []
         for _ in range(self.config.ppo_epochs):
             outputs = self.policy(response_ids, attention_mask=response_mask, output_hidden_states=True)
             new_logits = outputs.logits[:, prompt_len-1:-1, :]
@@ -503,24 +504,51 @@ class PPOTrainer:
             new_hidden = outputs.hidden_states[-1][:, prompt_len-1:-1, :]
             new_values = self.value_head(new_hidden).squeeze(-1)
             
-            ratio = torch.exp(new_token_log_probs - token_log_probs.detach())
+            # Clamp log ratio to prevent exp() explosion
+            log_ratio = new_token_log_probs - token_log_probs.detach()
+            log_ratio = torch.clamp(log_ratio, -20.0, 20.0)  # Prevent extreme ratios
+            ratio = torch.exp(log_ratio)
+            
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - self.config.ppo_clip, 1 + self.config.ppo_clip) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
             
-            value_loss = F.mse_loss(new_values, returns)
+            # Clipped value loss (PPO-style)
+            value_clipped = values.detach() + torch.clamp(
+                new_values - values.detach(), -self.config.ppo_clip, self.config.ppo_clip
+            )
+            value_loss1 = (new_values - returns) ** 2
+            value_loss2 = (value_clipped - returns) ** 2
+            value_loss = 0.5 * torch.max(value_loss1, value_loss2).mean()
+            
             entropy = -(new_log_probs.exp() * new_log_probs).sum(dim=-1).mean()
             
             loss = policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
             
+            # Skip update if loss is invalid
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+            
             self.optimizer.zero_grad()
             loss.backward()
+            
+            # Track gradient norms before clipping
+            grad_norms = [p.grad.norm().item() for p in self.policy.parameters() if p.grad is not None]
+            all_grad_norms.extend(grad_norms)
+            
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.value_head.parameters(), 1.0)
             self.optimizer.step()
             
             total_loss += loss.item()
         
-        return {"loss": total_loss / self.config.ppo_epochs, "reward": rewards.mean().item(), "kl": kl.mean().item()}
+        return {
+            "loss": total_loss / self.config.ppo_epochs, 
+            "reward": rewards.mean().item(), 
+            "kl": kl.mean().item(),
+            "grad_norm_mean": np.mean(all_grad_norms) if all_grad_norms else 0,
+            "grad_norm_std": np.std(all_grad_norms) if all_grad_norms else 0,
+        }
 
 
 # ============================================================================
@@ -745,6 +773,7 @@ def train_method(
     tokenizer = AutoTokenizer.from_pretrained(config.base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Required for decoder-only models
     
     # Load model with LoRA
     base_model = AutoModelForCausalLM.from_pretrained(config.base_model, torch_dtype=torch.float32).to(config.device)
@@ -919,6 +948,7 @@ def main(output_dir: str = "/data/results"):
     tokenizer = AutoTokenizer.from_pretrained(config.base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Required for decoder-only models
     
     # Create data splits ONCE (shared across all methods)
     data_splits = DataSplits(config, tokenizer)

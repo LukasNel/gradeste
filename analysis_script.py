@@ -6,6 +6,7 @@ Updated for proper train/val/test splits.
 Run after training: python analysis.py --results_dir ./results
 """
 
+from dataclasses import dataclass
 import json
 import numpy as np
 import matplotlib.pyplot as plt
@@ -743,9 +744,9 @@ def generate_paper_prompt(results: dict, metrics: dict, output_dir: Path) -> str
                 t_stat, p_value = stats.ttest_ind(r1, r2)
                 stat_tests.append({
                     'comparison': f"{LABELS.get(m1, m1)} vs {LABELS.get(m2, m2)}",
-                    't_statistic': round(t_stat, 4),
-                    'p_value': round(p_value, 6),
-                    'significant': p_value < 0.05
+                    't_statistic': float(t_stat),
+                    'p_value': float(p_value),
+                    'significant': bool(p_value < 0.05)
                 })
     
     # Generalization gaps
@@ -761,7 +762,7 @@ def generate_paper_prompt(results: dict, metrics: dict, output_dir: Path) -> str
         g, p = metrics['gumbel'], metrics['ppo']
         if g.get('test_reward_mean', 0) >= p.get('test_reward_mean', 0) * 0.95:
             claims.append("GRADE achieves comparable TEST reward to PPO")
-        if g.get('grad_norm_std', float('inf')) < p.get('grad_norm_std', float('inf')):
+        if 'grad_norm_std' in g and 'grad_norm_std' in p and g['grad_norm_std'] < p['grad_norm_std']:
             ratio = g['grad_norm_std'] / p['grad_norm_std']
             claims.append(f"GRADE reduces gradient variance by {(1-ratio)*100:.1f}% compared to PPO")
         if g.get('steps_to_80') and p.get('steps_to_80'):
