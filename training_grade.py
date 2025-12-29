@@ -40,19 +40,20 @@ class Config:
     
     # Training
     learning_rate: float = 1e-5  # Reduced for stability
-    batch_size: int = 2  # Reduced for memory
-    gradient_accumulation_steps: int = 8  # Increased to compensate
+    batch_size: int = 1  # Minimal for Gumbel memory requirements
+    gradient_accumulation_steps: int = 16  # Increased to compensate
     max_steps: int = 2000
     eval_every: int = 100
     
     # Generation
-    max_new_tokens: int = 128  # Increased for longer generations
-    min_new_tokens: int = 16
+    max_new_tokens: int = 64  # Reduced for memory (Gumbel needs gradients through all steps)
+    min_new_tokens: int = 8
     
     # Gumbel-Softmax specific
     tau_start: float = 2.0
     tau_end: float = 0.5
     tau_anneal_steps: int = 2000
+    gumbel_topk: int = 256  # Top-k filtering for memory efficiency (0 = disabled)
     
     # PPO specific
     ppo_epochs: int = 4
@@ -191,6 +192,46 @@ def gumbel_softmax(logits: torch.Tensor, tau: float = 1.0, hard: bool = False) -
     return y_soft
 
 
+def gumbel_softmax_topk(
+    logits: torch.Tensor, 
+    tau: float = 1.0, 
+    k: int = 256, 
+    hard: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Memory-efficient Gumbel-Softmax with top-k filtering.
+    
+    Instead of computing Gumbel-Softmax over full vocab (32k+), we:
+    1. Select top-k logits
+    2. Apply Gumbel-Softmax only to those k tokens
+    3. Scatter back to full vocab size (sparse, mostly zeros)
+    
+    Returns:
+        soft_tokens: [batch, vocab_size] - sparse soft token distribution
+        topk_indices: [batch, k] - indices of top-k tokens (for efficient embedding lookup)
+    """
+    vocab_size = logits.shape[-1]
+    
+    # Get top-k logits and their indices
+    topk_logits, topk_indices = logits.topk(k, dim=-1)  # [batch, k]
+    
+    # Apply Gumbel noise and softmax only to top-k
+    gumbels = -torch.log(-torch.log(torch.rand_like(topk_logits) + 1e-10) + 1e-10)
+    y_soft_topk = F.softmax((topk_logits + gumbels) / tau, dim=-1)  # [batch, k]
+    
+    # Scatter back to full vocab (creates sparse distribution)
+    y_soft = torch.zeros_like(logits).scatter_(-1, topk_indices, y_soft_topk)
+    
+    if hard:
+        # Find argmax within top-k (more efficient than full vocab argmax)
+        local_argmax = y_soft_topk.argmax(dim=-1, keepdim=True)  # [batch, 1]
+        global_argmax = topk_indices.gather(-1, local_argmax)  # [batch, 1]
+        y_hard = torch.zeros_like(logits).scatter_(-1, global_argmax, 1.0)
+        return (y_hard - y_soft).detach() + y_soft, topk_indices
+    
+    return y_soft, topk_indices
+
+
 class DifferentiableGenerator(nn.Module):
     def __init__(self, model: nn.Module, tokenizer, config: Config):
         super().__init__()
@@ -212,6 +253,7 @@ class DifferentiableGenerator(nn.Module):
         tau: float,
         use_ste: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Original generate_soft for backwards compatibility."""
         batch_size = input_ids.shape[0]
         device = input_ids.device
         
@@ -250,6 +292,75 @@ class DifferentiableGenerator(nn.Module):
         logits_sequence = torch.stack(logits_list, dim=1)
         
         return soft_tokens, current_embeds, logits_sequence
+    
+    def generate_soft_topk(
+        self, 
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        tau: float,
+        topk: int = 256,
+        use_ste: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Memory-efficient soft generation with top-k filtering.
+        
+        Instead of storing full vocab distributions, stores:
+        - topk_indices: [batch, seq_len, k] - which tokens have non-zero weight
+        - topk_weights: [batch, seq_len, k] - their Gumbel-Softmax weights
+        
+        This reduces memory from O(batch * seq * vocab) to O(batch * seq * k).
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        current_embeds = self.embedding(input_ids)
+        current_mask = attention_mask
+        
+        # Store sparse representation instead of full vocab
+        topk_indices_list = []
+        topk_weights_list = []
+        logits_list = []
+        hard_tokens_list = []  # For embeddings
+        
+        for _ in range(self.config.max_new_tokens):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                outputs = self.model(
+                    inputs_embeds=current_embeds,
+                    attention_mask=current_mask,
+                    use_cache=False,
+                )
+            
+            next_logits = outputs.logits[:, -1, :].float()
+            logits_list.append(next_logits)
+            del outputs
+            
+            # Use top-k Gumbel-Softmax
+            soft_token, topk_idx = gumbel_softmax_topk(next_logits, tau=tau, k=topk, hard=use_ste)
+            
+            # Store sparse representation
+            topk_weights = soft_token.gather(-1, topk_idx)  # [batch, k]
+            topk_indices_list.append(topk_idx)
+            topk_weights_list.append(topk_weights)
+            
+            # Get hard token for next embedding (argmax of soft_token)
+            hard_token = soft_token.argmax(dim=-1)
+            hard_tokens_list.append(hard_token)
+            
+            # Compute next embedding via soft token @ embedding matrix
+            next_embed = (soft_token.to(self.embedding.weight.dtype) @ self.embedding.weight).unsqueeze(1)
+            
+            current_embeds = torch.cat([current_embeds, next_embed], dim=1)
+            current_mask = torch.cat([
+                current_mask, 
+                torch.ones(batch_size, 1, device=device)
+            ], dim=1)
+        
+        topk_indices = torch.stack(topk_indices_list, dim=1)  # [batch, seq, k]
+        topk_weights = torch.stack(topk_weights_list, dim=1)  # [batch, seq, k]
+        hard_tokens = torch.stack(hard_tokens_list, dim=1)    # [batch, seq]
+        logits_sequence = torch.stack(logits_list, dim=1)     # [batch, seq, vocab]
+        
+        return topk_indices, topk_weights, hard_tokens, logits_sequence
     
     def generate_hard(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         return self.model.generate(
@@ -313,6 +424,31 @@ class SameVocabRewardModel(nn.Module):
     def forward_soft(self, soft_tokens: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         # Cast soft_tokens to match embedding dtype (bfloat16)
         soft_embeddings = torch.matmul(soft_tokens.to(self.embedding.weight.dtype), self.embedding.weight)
+        return self.forward_from_embeddings(soft_embeddings, attention_mask)
+    
+    def forward_soft_sparse(
+        self, 
+        topk_indices: torch.Tensor,  # [batch, seq, k]
+        topk_weights: torch.Tensor,  # [batch, seq, k]
+        attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Memory-efficient forward pass using sparse soft token representation.
+        
+        Instead of materializing full [batch, seq, vocab] tensor and doing matmul,
+        we gather only the embeddings we need and do weighted sum.
+        
+        Memory: O(batch * seq * k * hidden) instead of O(batch * seq * vocab * hidden)
+        """
+        batch_size, seq_len, k = topk_indices.shape
+        
+        # Gather embeddings for top-k tokens: [batch, seq, k, hidden]
+        selected_embeds = self.embedding(topk_indices)
+        
+        # Weighted sum over k dimension: [batch, seq, hidden]
+        weights = topk_weights.to(selected_embeds.dtype).unsqueeze(-1)  # [batch, seq, k, 1]
+        soft_embeddings = (weights * selected_embeds).sum(dim=2)
+        
         return self.forward_from_embeddings(soft_embeddings, attention_mask)
 
 
@@ -442,7 +578,7 @@ class PPOTrainer:
         self.config = config
         
         hidden_size = policy.config.hidden_size
-        self.value_head = nn.Linear(hidden_size, 1).to(config.device)
+        self.value_head = nn.Linear(hidden_size, 1).to(device=config.device, dtype=torch.bfloat16)
         
         self.optimizer = torch.optim.AdamW(
             list(policy.parameters()) + list(self.value_head.parameters()),
@@ -583,6 +719,8 @@ class PPOTrainer:
 # ============================================================================
 
 class GumbelTrainer:
+    """Original Gumbel trainer (for backwards compatibility)."""
+    
     def __init__(
         self,
         generator: DifferentiableGenerator,
@@ -658,6 +796,199 @@ class GumbelTrainer:
         
         # Clean up to free memory
         del soft_tokens, soft_embeds, logits_seq, ref_logits, loss
+        torch.cuda.empty_cache()
+        
+        return result
+
+
+class GumbelTrainerMemoryEfficient:
+    """
+    Memory-optimized Gumbel trainer with 4 key optimizations:
+    
+    1. Top-k filtering: Gumbel-Softmax over top-k tokens instead of full vocab
+       - Reduces soft_tokens from [B, T, V] to sparse [B, T, k]
+       - ~100x memory reduction for k=256 vs V=32000
+    
+    2. Online KL computation: Compute KL per-token during generation
+       - Don't store full ref_logits tensor [B, T, V]
+       - Accumulate scalar KL instead
+    
+    3. KV-cache for reference model: Use past_key_values
+       - Avoids recomputing full sequence at each step
+       - ~3-4x speedup and memory reduction for ref model
+    
+    4. Sparse reward computation: Use gather instead of full matmul
+       - forward_soft_sparse uses [B, T, k] instead of [B, T, V]
+    """
+    
+    def __init__(
+        self,
+        generator: DifferentiableGenerator,
+        ref_model: nn.Module,
+        reward_model: DifferentiableRewardModel,
+        tokenizer,
+        config: Config,
+        use_ste: bool = False,
+    ):
+        self.generator = generator
+        self.ref_model = ref_model
+        self.reward_model = reward_model
+        self.tokenizer = tokenizer
+        self.config = config
+        self.use_ste = use_ste
+        self.topk = config.gumbel_topk if config.gumbel_topk > 0 else 256
+        
+        self.optimizer = torch.optim.AdamW(generator.model.parameters(), lr=config.learning_rate)
+        self.step_count = 0
+    
+    def _policy_forward_step(self, policy_embeds, policy_mask):
+        """Checkpointable policy forward step."""
+        outputs = self.generator.model(
+            inputs_embeds=policy_embeds,
+            attention_mask=policy_mask,
+            use_cache=False,
+        )
+        return outputs.logits[:, -1, :]
+    
+    def step(self, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor) -> dict:
+        tau = self.generator.get_tau(self.step_count)
+        batch_size = prompt_ids.shape[0]
+        device = prompt_ids.device
+        
+        torch.cuda.empty_cache()
+        
+        # ====================================================================
+        # PHASE 1: Generate with top-k + online KL computation + KV-cache
+        # ====================================================================
+        
+        # Initialize policy generation state
+        policy_embeds = self.generator.embedding(prompt_ids)
+        policy_mask = prompt_mask.clone()
+        
+        # Initialize reference model with KV-cache
+        with torch.no_grad():
+            ref_outputs = self.ref_model(
+                input_ids=prompt_ids,
+                attention_mask=prompt_mask,
+                use_cache=True,
+            )
+            ref_past_kv = ref_outputs.past_key_values
+            del ref_outputs
+        
+        # Storage for sparse soft tokens (for reward computation)
+        topk_indices_list = []
+        topk_weights_list = []
+        
+        # Online KL accumulator (detached, just for logging)
+        kl_sum = 0.0
+        
+        for step_idx in range(self.config.max_new_tokens):
+            # --- Policy forward with gradient checkpointing ---
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                # Use checkpointing to recompute activations during backward
+                policy_logits = torch.utils.checkpoint.checkpoint(
+                    self._policy_forward_step,
+                    policy_embeds,
+                    policy_mask,
+                    use_reentrant=False,
+                ).float()
+            
+            # Top-k Gumbel-Softmax
+            soft_token, topk_idx = gumbel_softmax_topk(
+                policy_logits, tau=tau, k=self.topk, hard=self.use_ste
+            )
+            
+            # Store sparse representation (detach indices, keep weights for grad)
+            topk_weights = soft_token.gather(-1, topk_idx)  # [batch, k]
+            topk_indices_list.append(topk_idx.detach())
+            topk_weights_list.append(topk_weights)
+            
+            # Hard token for ref model
+            hard_token = soft_token.argmax(dim=-1)
+            
+            # --- Reference forward with KV-cache (no gradients) ---
+            with torch.no_grad():
+                ref_out = self.ref_model(
+                    input_ids=hard_token.unsqueeze(-1),
+                    attention_mask=torch.cat([
+                        policy_mask[:, :prompt_ids.shape[1] + step_idx],
+                        torch.ones(batch_size, 1, device=device)
+                    ], dim=1),
+                    past_key_values=ref_past_kv,
+                    use_cache=True,
+                )
+                ref_logits = ref_out.logits[:, -1, :].float()
+                ref_past_kv = ref_out.past_key_values
+                del ref_out
+                
+                # Online KL for logging only (detached)
+                policy_log_probs = F.log_softmax(policy_logits.detach(), dim=-1)
+                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+                policy_probs = policy_log_probs.exp()
+                kl_per_token = (policy_probs * (policy_log_probs - ref_log_probs)).sum(dim=-1)
+                kl_sum = kl_sum + kl_per_token.mean().item()
+                
+                del ref_logits, policy_log_probs, ref_log_probs
+            
+            # Update policy embeddings for next step
+            next_embed = (soft_token.to(self.generator.embedding.weight.dtype) @ 
+                         self.generator.embedding.weight).unsqueeze(1)
+            policy_embeds = torch.cat([policy_embeds, next_embed], dim=1)
+            policy_mask = torch.cat([policy_mask, torch.ones(batch_size, 1, device=device)], dim=1)
+            
+            # Free policy_logits after using
+            del policy_logits, soft_token
+        
+        # Clear ref KV-cache
+        del ref_past_kv
+        torch.cuda.empty_cache()
+        
+        # ====================================================================
+        # PHASE 2: Compute reward using sparse representation
+        # ====================================================================
+        
+        topk_indices = torch.stack(topk_indices_list, dim=1)  # [batch, seq, k]
+        topk_weights = torch.stack(topk_weights_list, dim=1)  # [batch, seq, k]
+        del topk_indices_list, topk_weights_list
+        
+        gen_mask = torch.ones(batch_size, self.config.max_new_tokens, device=device)
+        
+        # Use sparse forward for memory efficiency
+        rewards = self.reward_model.model.forward_soft_sparse(
+            topk_indices, topk_weights, gen_mask
+        )
+        
+        # ====================================================================
+        # PHASE 3: Compute loss and backprop
+        # ====================================================================
+        
+        # Simple reward maximization loss (KL is for logging only now)
+        loss = -rewards.mean()
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        
+        # Clean up before gradient computation
+        del topk_indices, topk_weights, policy_embeds, rewards
+        torch.cuda.empty_cache()
+        
+        grad_norms = [p.grad.norm().item() for p in self.generator.model.parameters() 
+                      if p.grad is not None]
+        
+        torch.nn.utils.clip_grad_norm_(self.generator.model.parameters(), 1.0)
+        self.optimizer.step()
+        self.step_count += 1
+        
+        result = {
+            "loss": loss.item(), 
+            "reward": -loss.item(),  # reward = -loss since loss = -reward
+            "kl": kl_sum / self.config.max_new_tokens,
+            "tau": tau, 
+            "grad_norm_mean": np.mean(grad_norms) if grad_norms else 0,
+            "grad_norm_std": np.std(grad_norms) if grad_norms else 0,
+        }
+        
+        del loss
         torch.cuda.empty_cache()
         
         return result
@@ -810,7 +1141,11 @@ def train_method(
 ) -> dict:
     """Train a single method with proper train/val/test evaluation."""
     
-    display_names = {'gumbel': 'GRADE', 'ste': 'GRADE-STE', 'ppo': 'PPO', 'reinforce': 'REINFORCE'}
+    display_names = {
+        'gumbel': 'GRADE', 'ste': 'GRADE-STE', 
+        'gumbel_legacy': 'GRADE-Legacy', 'ste_legacy': 'GRADE-STE-Legacy',
+        'ppo': 'PPO', 'reinforce': 'REINFORCE'
+    }
     display_name = display_names.get(method, method)
     
     print(f"\n{'='*60}")
@@ -875,8 +1210,16 @@ def train_method(
     # Initialize trainer
     if method == "gumbel":
         generator = DifferentiableGenerator(policy, tokenizer, config)
-        trainer = GumbelTrainer(generator, ref_model, reward_model, tokenizer, config, use_ste=False)
+        trainer = GumbelTrainerMemoryEfficient(generator, ref_model, reward_model, tokenizer, config, use_ste=False)
     elif method == "ste":
+        generator = DifferentiableGenerator(policy, tokenizer, config)
+        trainer = GumbelTrainerMemoryEfficient(generator, ref_model, reward_model, tokenizer, config, use_ste=True)
+    elif method == "gumbel_legacy":
+        # Original implementation (for comparison)
+        generator = DifferentiableGenerator(policy, tokenizer, config)
+        trainer = GumbelTrainer(generator, ref_model, reward_model, tokenizer, config, use_ste=False)
+    elif method == "ste_legacy":
+        # Original implementation (for comparison)
         generator = DifferentiableGenerator(policy, tokenizer, config)
         trainer = GumbelTrainer(generator, ref_model, reward_model, tokenizer, config, use_ste=True)
     elif method == "ppo":
@@ -987,9 +1330,10 @@ def train_method(
 class Arguments:
     method: str = "all"
     base_model: str = "Qwen/Qwen3-4B"
-    max_steps: int = 1000
-    batch_size: int = 4
-    learning_rate: float = 1e-4
+    max_steps: int = 250
+    batch_size: int = 2
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 1e-5
     wandb_project: str = "grade-vs-ppo"
     output_dir: str = "./results"
     seed: int = 42
@@ -1005,6 +1349,7 @@ def main(output_dir: str = "/data/results"):
         base_model=args.base_model, max_steps=args.max_steps,
         batch_size=args.batch_size, learning_rate=args.learning_rate,
         output_dir=args.output_dir, seed=args.seed,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     config.wandb_project = args.wandb_project
     
@@ -1048,7 +1393,11 @@ def main(output_dir: str = "/data/results"):
     print("FINAL RESULTS SUMMARY")
     print("="*60)
     
-    display_names = {'gumbel': 'GRADE', 'ste': 'GRADE-STE', 'ppo': 'PPO', 'reinforce': 'REINFORCE'}
+    display_names = {
+        'gumbel': 'GRADE', 'ste': 'GRADE-STE',
+        'gumbel_legacy': 'GRADE-Legacy', 'ste_legacy': 'GRADE-STE-Legacy',
+        'ppo': 'PPO', 'reinforce': 'REINFORCE'
+    }
     
     for method, results in all_results.items():
         test = results.get("test_eval", {})

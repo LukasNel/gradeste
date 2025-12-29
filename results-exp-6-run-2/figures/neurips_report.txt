@@ -1,0 +1,80 @@
+================================================================================
+NEURIPS EXPERIMENTAL RESULTS REPORT
+GRADE: Replacing Policy Gradients with Backpropagation for LLM Alignment
+================================================================================
+
+## DATA SPLITS
+----------------------------------------
+  Reward Model Training: 5,000 samples (IMDB train[0:5000])
+  Policy Training: 10,000 samples (IMDB train[5000:15000])
+  Validation: 2,000 samples (IMDB train[15000:17000])
+  Test: 25,000 samples (IMDB test split)
+
+## EXECUTIVE SUMMARY
+----------------------------------------
+Best TEST Reward: GRADE-STE (0.7627)
+Lowest Gradient Variance: GRADE-STE (0.0034)
+
+### Key Findings:
+✓ GRADE achieves comparable TEST reward to PPO (0.590 vs 0.510)
+
+### Generalization Analysis:
+  GRADE: Val-Test gap = -0.0028 (good)
+  PPO: Val-Test gap = 0.0626 (overfitting)
+  REINFORCE: Val-Test gap = 0.0370 (good)
+  GRADE-STE: Val-Test gap = -0.0770 (underfitting)
+
+## DETAILED RESULTS
+----------------------------------------
+
+### Test Performance (Final Evaluation)
+Method               Test Reward          Std             Best Val       
+----------------------------------------------------------------------
+GRADE                0.5898               0.3928          0.5870         
+PPO                  0.5104               0.3127          0.5730         
+REINFORCE            0.6173               0.3779          0.6543         
+GRADE-STE            0.7627               0.3438          0.6857         
+
+### Gradient Statistics
+Method               Mean Norm       Std Dev         Variance Ratio 
+----------------------------------------------------------------------
+GRADE                57.5783         68.4362         1.1886         
+REINFORCE            0.0459          0.0497          1.0832         
+GRADE-STE            0.0027          0.0034          1.2531         
+
+### Sample Efficiency (Steps to Reach Target Training Reward)
+Method               60%        70%        80%        85%        90%       
+----------------------------------------------------------------------
+GRADE                N/A        N/A        N/A        N/A        N/A        
+PPO                  N/A        N/A        N/A        N/A        N/A        
+REINFORCE            N/A        N/A        N/A        N/A        N/A        
+GRADE-STE            90         145        N/A        N/A        N/A        
+
+### Training Stability & KL
+Method               Reward Variance      Final KL        Max KL         
+----------------------------------------------------------------------
+GRADE                0.010700             4.9363          10.0081        
+PPO                  0.029768             -3.1196         0.2721         
+REINFORCE            0.025532             -0.0121         0.0797         
+GRADE-STE            0.055204             11.1427         20.6422        
+
+## STATISTICAL SIGNIFICANCE
+----------------------------------------
+GRADE vs PPO: t=-4.822, p=0.0000 ***
+GRADE vs REINFORCE: t=-5.658, p=0.0000 ***
+GRADE vs GRADE-STE: t=-8.610, p=0.0000 ***
+PPO vs REINFORCE: t=-0.464, p=0.6438 
+PPO vs GRADE-STE: t=-4.366, p=0.0000 ***
+REINFORCE vs GRADE-STE: t=-4.086, p=0.0001 ***
+
+Significance levels: * p<0.05, ** p<0.01, *** p<0.001
+
+## GENERATED FIGURES
+----------------------------------------
+1. fig1_learning_curves.pdf - Training reward, Loss, KL over steps
+2. fig2_validation_curves.pdf - Validation reward & generalization gap
+3. fig3_gradient_analysis.pdf - Gradient norms and variance comparison
+4. fig4_sample_efficiency.pdf - Steps to reach reward thresholds
+5. fig5_final_comparison.pdf - Test performance & val vs test comparison
+6. fig6_tau_ablation.pdf - Temperature schedule analysis (Gumbel only)
+7. results_table.tex - LaTeX table for paper

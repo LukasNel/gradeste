@@ -1,0 +1,26 @@
+{
+  "gumbel": {
+    "test_reward_mean": 0.5898229504313204,
+    "test_reward_std": 0.39280379144188005,
+    "best_val_reward": 0.5870330390128947,
+    "best_val_step": 200
+  },
+  "ste": {
+    "test_reward_mean": 0.7626937252734497,
+    "test_reward_std": 0.34383794640053067,
+    "best_val_reward": 0.6857167674863013,
+    "best_val_step": 200
+  },
+  "ppo": {
+    "test_reward_mean": 0.5104104777167376,
+    "test_reward_std": 0.3126669486806951,
+    "best_val_reward": 0.5729786024334317,
+    "best_val_step": 0
+  },
+  "reinforce": {
+    "test_reward_mean": 0.6173225556457037,
+    "test_reward_std": 0.3778516740969312,
+    "best_val_reward": 0.6543011823351844,
+    "best_val_step": 100
+  }
+}

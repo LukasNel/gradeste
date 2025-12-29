@@ -5,7 +5,7 @@ app = modal.App("grade-vs-ppo")
 image = modal.Image.debian_slim("3.12").uv_sync().add_local_python_source("training_grade").add_local_python_source("analysis_script")
 vol = modal.Volume.from_name("grade-vs-ppo-data", create_if_missing=True)
 VOL_DIR = "/data"
-OUTPUT_DIR = f"{VOL_DIR}/results-exp-4"
+OUTPUT_DIR = f"{VOL_DIR}/results-exp-6-run-2"
 HOURS= 60*60
 @app.function(image=image, gpu="A100-80GB", volumes={
     VOL_DIR: vol,
