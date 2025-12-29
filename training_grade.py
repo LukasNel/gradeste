@@ -30,23 +30,23 @@ from pathlib import Path
 @dataclass
 class Config:
     # Model
-    base_model: str = "EleutherAI/pythia-410m"
+    base_model: str = "Qwen/Qwen3-4B"
     
     # LoRA (optional)
-    use_lora: bool = False
+    use_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     
     # Training
-    learning_rate: float = 1e-4
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 4
+    learning_rate: float = 1e-5  # Reduced for stability
+    batch_size: int = 2  # Reduced for memory
+    gradient_accumulation_steps: int = 8  # Increased to compensate
     max_steps: int = 2000
     eval_every: int = 100
     
     # Generation
-    max_new_tokens: int = 48
+    max_new_tokens: int = 128  # Increased for longer generations
     min_new_tokens: int = 16
     
     # Gumbel-Softmax specific
@@ -222,20 +222,23 @@ class DifferentiableGenerator(nn.Module):
         logits_list = []
         
         for _ in range(self.config.max_new_tokens):
-            outputs = self.model(
-                inputs_embeds=current_embeds,
-                attention_mask=current_mask,
-                use_cache=False,
-            )
+            # Use autocast for memory efficiency in the forward pass
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                outputs = self.model(
+                    inputs_embeds=current_embeds,
+                    attention_mask=current_mask,
+                    use_cache=False,
+                )
             
-            next_logits = outputs.logits[:, -1, :]
+            next_logits = outputs.logits[:, -1, :].float()  # Cast to float32 for gumbel
             logits_list.append(next_logits)
+            del outputs  # Free memory immediately
             
             soft_token = gumbel_softmax(next_logits, tau=tau, hard=use_ste)
             soft_tokens_list.append(soft_token)
             
-            next_embed = soft_token @ self.embedding.weight
-            next_embed = next_embed.unsqueeze(1)
+            # Project back to bfloat16 for embeddings
+            next_embed = (soft_token.to(self.embedding.weight.dtype) @ self.embedding.weight).unsqueeze(1)
             
             current_embeds = torch.cat([current_embeds, next_embed], dim=1)
             current_mask = torch.cat([
@@ -267,15 +270,20 @@ class DifferentiableGenerator(nn.Module):
 class SameVocabRewardModel(nn.Module):
     def __init__(self, base_model_name: str, device: str, num_labels: int = 2):
         super().__init__()
-        self.transformer = AutoModelForCausalLM.from_pretrained(base_model_name)
+        self.transformer = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+        )
         self.embedding = self.transformer.get_input_embeddings()
         hidden_size = self.transformer.config.hidden_size
         
+        # Classifier in float32 for training stability
         self.classifier = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
             nn.Linear(hidden_size, num_labels),
-        )
+        ).float()
         
         self.device = device
         self.to(device)
@@ -290,7 +298,7 @@ class SameVocabRewardModel(nn.Module):
         
         hidden_states = outputs.hidden_states[-1]
         mask_expanded = attention_mask.unsqueeze(-1).float()
-        sum_hidden = (hidden_states * mask_expanded).sum(dim=1)
+        sum_hidden = (hidden_states.float() * mask_expanded).sum(dim=1)
         mean_hidden = sum_hidden / mask_expanded.sum(dim=1).clamp(min=1e-9)
         
         logits = self.classifier(mean_hidden)
@@ -303,7 +311,8 @@ class SameVocabRewardModel(nn.Module):
         return self.forward_from_embeddings(embeds, attention_mask)
     
     def forward_soft(self, soft_tokens: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        soft_embeddings = torch.matmul(soft_tokens, self.embedding.weight)
+        # Cast soft_tokens to match embedding dtype (bfloat16)
+        soft_embeddings = torch.matmul(soft_tokens.to(self.embedding.weight.dtype), self.embedding.weight)
         return self.forward_from_embeddings(soft_embeddings, attention_mask)
 
 
@@ -596,6 +605,9 @@ class GumbelTrainer:
     def step(self, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor) -> dict:
         tau = self.generator.get_tau(self.step_count)
         
+        # Clear cache before memory-intensive operation
+        torch.cuda.empty_cache()
+        
         soft_tokens, soft_embeds, logits_seq = self.generator.generate_soft(
             prompt_ids, prompt_mask, tau=tau, use_ste=self.use_ste
         )
@@ -638,11 +650,17 @@ class GumbelTrainer:
         self.optimizer.step()
         self.step_count += 1
         
-        return {
+        result = {
             "loss": loss.item(), "reward": rewards.mean().item(), "kl": kl.item(),
             "tau": tau, "grad_norm_mean": np.mean(grad_norms) if grad_norms else 0,
             "grad_norm_std": np.std(grad_norms) if grad_norms else 0,
         }
+        
+        # Clean up to free memory
+        del soft_tokens, soft_embeds, logits_seq, ref_logits, loss
+        torch.cuda.empty_cache()
+        
+        return result
 
 
 # ============================================================================
@@ -809,16 +827,23 @@ def train_method(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # Required for decoder-only models
     
-    # Load model
-    base_model = AutoModelForCausalLM.from_pretrained(config.base_model, torch_dtype=torch.float32).to(config.device)
+    # Load model with bfloat16 for memory efficiency
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.base_model, 
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",  # Avoid flash attention issues with soft tokens
+    ).to(config.device)
+    base_model.gradient_checkpointing_enable()  # Save memory during backprop
     
     if config.use_lora:
         if "pythia" in config.base_model.lower():
             target_modules = ["query_key_value"]
         elif "gpt2" in config.base_model.lower():
             target_modules = ["c_attn", "c_proj"]
+        elif "qwen" in config.base_model.lower():
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
         else:
-            target_modules = ["c_attn"]
+            target_modules = ["q_proj", "v_proj"]  # Common default for LLaMA-style models
         
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, r=config.lora_r,
@@ -833,7 +858,11 @@ def train_method(
         total_params = sum(p.numel() for p in policy.parameters())
         print(f"trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.2f}")
     
-    ref_model = AutoModelForCausalLM.from_pretrained(config.base_model, torch_dtype=torch.float32).to(config.device)
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        config.base_model, 
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
+    ).to(config.device)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
@@ -957,7 +986,7 @@ def train_method(
 @dataclass
 class Arguments:
     method: str = "all"
-    base_model: str = "openai-community/gpt2-medium"
+    base_model: str = "Qwen/Qwen3-4B"
     max_steps: int = 1000
     batch_size: int = 4
     learning_rate: float = 1e-4

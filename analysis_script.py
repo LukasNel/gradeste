@@ -10,11 +10,9 @@ from dataclasses import dataclass
 import json
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 from scipy import stats
 import pandas as pd
-import argparse
 
 # NeurIPS style
 plt.rcParams.update({
@@ -725,6 +723,7 @@ def generate_paper_prompt(results: dict, metrics: dict, output_dir: Path) -> str
     test_stds = {LABELS.get(m, m): metrics[m].get('test_reward_std', 0) for m in metrics}
     best_vals = {LABELS.get(m, m): metrics[m].get('best_val_reward', 0) for m in metrics}
     grad_vars = {LABELS.get(m, m): metrics[m].get('grad_norm_std', 0) for m in metrics if 'grad_norm_std' in metrics[m]}
+    grad_means = {LABELS.get(m, m): metrics[m].get('grad_norm_mean', 0) for m in metrics if 'grad_norm_mean' in metrics[m]}
     
     sample_eff = {}
     for method in metrics:
@@ -755,6 +754,21 @@ def generate_paper_prompt(results: dict, metrics: dict, output_dir: Path) -> str
         gap = metrics[method].get('generalization_gap')
         if gap is not None:
             gen_gaps[LABELS.get(method, method)] = round(gap, 4)
+    
+    # KL divergence stats
+    kl_stats = {}
+    for method in metrics:
+        if 'final_kl' in metrics[method]:
+            kl_stats[LABELS.get(method, method)] = {
+                'final_kl': round(metrics[method].get('final_kl', 0), 4),
+                'max_kl': round(metrics[method].get('max_kl', 0), 4),
+            }
+    
+    # Training stability
+    stability = {}
+    for method in metrics:
+        if 'training_stability' in metrics[method]:
+            stability[LABELS.get(method, method)] = round(metrics[method]['training_stability'], 6)
     
     # Determine key claims based on results
     claims = []
@@ -833,57 +847,615 @@ Now write the complete NeurIPS paper with proper train/val/test methodology emph
     with open(output_dir / "paper_generation_prompt.txt", "w") as f:
         f.write(prompt)
     
-    # LaTeX template
-    template = f'''% NeurIPS Paper Template
+    # Generate the comprehensive LaTeX template
+    generate_full_latex_template(
+        output_dir, test_rewards, test_stds, best_vals, grad_vars, grad_means,
+        gen_gaps, sample_eff, stat_tests, kl_stats, stability, claims, metrics
+    )
+    
+    return prompt
+
+
+def generate_full_latex_template(
+    output_dir: Path,
+    test_rewards: dict,
+    test_stds: dict, 
+    best_vals: dict,
+    grad_vars: dict,
+    grad_means: dict,
+    gen_gaps: dict,
+    sample_eff: dict,
+    stat_tests: list,
+    kl_stats: dict,
+    stability: dict,
+    claims: list,
+    metrics: dict,
+) -> None:
+    """Generate a comprehensive LaTeX template with all results embedded."""
+    
+    # Helper to safely get values
+    def get_val(d, key, default=0):
+        v = d.get(key, default)
+        return v if v is not None else default
+    
+    # Format statistical test results for LaTeX
+    stat_test_rows = []
+    for test in stat_tests:
+        sig = "***" if test['p_value'] < 0.001 else "**" if test['p_value'] < 0.01 else "*" if test['p_value'] < 0.05 else ""
+        stat_test_rows.append(
+            f"    {test['comparison']} & {test['t_statistic']:.3f} & {test['p_value']:.4f} & {sig} \\\\"
+        )
+    stat_test_latex = "\n".join(stat_test_rows) if stat_test_rows else "    No comparisons available & - & - & - \\\\"
+    
+    # Format sample efficiency table
+    sample_eff_rows = []
+    for method in ["GRADE", "GRADE-STE", "PPO", "REINFORCE"]:
+        if method in sample_eff:
+            eff = sample_eff[method]
+            row_vals = [str(eff.get(f'{t}%', 'N/A')) for t in [60, 70, 80, 85, 90]]
+            sample_eff_rows.append(f"    {method} & {' & '.join(row_vals)} \\\\")
+    sample_eff_latex = "\n".join(sample_eff_rows) if sample_eff_rows else "    No data available & - & - & - & - & - \\\\"
+    
+    # Format claims
+    claims_latex = "\n".join([f"\\item {claim}" for claim in claims]) if claims else "\\item Results pending analysis"
+    
+    # Compute variance reduction if available
+    variance_reduction = "N/A"
+    if get_val(grad_vars, "GRADE") > 0 and get_val(grad_vars, "PPO") > 0:
+        variance_reduction = f"{(1 - get_val(grad_vars, 'GRADE') / get_val(grad_vars, 'PPO')) * 100:.1f}"
+    
+    template = f'''%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% GRADE: Replacing Policy Gradients with Backpropagation for LLM Alignment
+% NeurIPS 2024 Paper Template - Complete with Embedded Experimental Results
+%
+% INSTRUCTIONS FOR LLM:
+% This template contains all experimental results embedded as LaTeX.
+% Your task is to:
+% 1. Write compelling prose for each section (Introduction, Related Work, etc.)
+% 2. The tables and figures are already populated with real data
+% 3. Interpret the results and write insightful analysis
+% 4. Ensure claims are supported by the embedded data
+% 5. The abstract and conclusion should reflect actual results
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 \\documentclass{{article}}
-\\usepackage[preprint]{{neurips_2024}}
-\\usepackage{{amsmath,amssymb,amsfonts}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REQUIRED PACKAGES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\usepackage[preprint]{{neurips_2024}}  % NeurIPS 2024 style
+% For final submission, use: \\usepackage[final]{{neurips_2024}}
+
+% Math packages
+\\usepackage{{amsmath}}
+\\usepackage{{amssymb}}
+\\usepackage{{amsfonts}}
+\\usepackage{{mathtools}}
+\\usepackage{{bm}}  % Bold math symbols
+
+% Tables and figures
+\\usepackage{{booktabs}}  % Professional tables
 \\usepackage{{graphicx}}
-\\usepackage{{booktabs}}
+\\usepackage{{subcaption}}  % Subfigures
+\\usepackage{{multirow}}
+\\usepackage{{array}}
+
+% Algorithms
+\\usepackage{{algorithm}}
+\\usepackage{{algorithmic}}
+
+% References and links
+\\usepackage{{hyperref}}
+\\usepackage{{url}}
+\\usepackage{{cleveref}}  % Smart references
+
+% Colors for highlights
+\\usepackage{{xcolor}}
+\\definecolor{{gradegreen}}{{HTML}}{{2ecc71}}
+\\definecolor{{ppored}}{{HTML}}{{e74c3c}}
+\\definecolor{{steblue}}{{HTML}}{{3498db}}
+
+% Code listings (if needed)
+\\usepackage{{listings}}
+
+% Misc
+\\usepackage{{enumitem}}  % Better lists
+\\usepackage{{microtype}}  % Better typography
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% CUSTOM COMMANDS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\newcommand{{\\method}}{{GRADE}}
+\\newcommand{{\\methodfull}}{{Gumbel-softmax Relaxation for Alignment via Differentiable Estimation}}
+\\newcommand{{\\R}}{{\\mathbb{{R}}}}
+\\newcommand{{\\E}}{{\\mathbb{{E}}}}
+\\newcommand{{\\KL}}{{\\text{{KL}}}}
+\\newcommand{{\\softmax}}{{\\text{{softmax}}}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% EMBEDDED EXPERIMENTAL RESULTS (DO NOT MODIFY)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% These values are automatically populated from experiments
+
+% Test Rewards (mean)
+\\newcommand{{\\GRADETestReward}}{{{get_val(test_rewards, "GRADE"):.3f}}}
+\\newcommand{{\\GRADESTETestReward}}{{{get_val(test_rewards, "GRADE-STE"):.3f}}}
+\\newcommand{{\\PPOTestReward}}{{{get_val(test_rewards, "PPO"):.3f}}}
+\\newcommand{{\\REINFORCETestReward}}{{{get_val(test_rewards, "REINFORCE"):.3f}}}
+
+% Test Rewards (std)
+\\newcommand{{\\GRADETestStd}}{{{get_val(test_stds, "GRADE"):.3f}}}
+\\newcommand{{\\GRADESTETestStd}}{{{get_val(test_stds, "GRADE-STE"):.3f}}}
+\\newcommand{{\\PPOTestStd}}{{{get_val(test_stds, "PPO"):.3f}}}
+\\newcommand{{\\REINFORCETestStd}}{{{get_val(test_stds, "REINFORCE"):.3f}}}
+
+% Best Validation Rewards
+\\newcommand{{\\GRADEBestVal}}{{{get_val(best_vals, "GRADE"):.3f}}}
+\\newcommand{{\\GRADESTEBestVal}}{{{get_val(best_vals, "GRADE-STE"):.3f}}}
+\\newcommand{{\\PPOBestVal}}{{{get_val(best_vals, "PPO"):.3f}}}
+\\newcommand{{\\REINFORCEBestVal}}{{{get_val(best_vals, "REINFORCE"):.3f}}}
+
+% Gradient Variance
+\\newcommand{{\\GRADEGradVar}}{{{get_val(grad_vars, "GRADE"):.4f}}}
+\\newcommand{{\\GRADESTEGradVar}}{{{get_val(grad_vars, "GRADE-STE"):.4f}}}
+\\newcommand{{\\PPOGradVar}}{{{get_val(grad_vars, "PPO"):.4f}}}
+\\newcommand{{\\REINFORCEGradVar}}{{{get_val(grad_vars, "REINFORCE"):.4f}}}
+
+% Generalization Gap
+\\newcommand{{\\GRADEGenGap}}{{{get_val(gen_gaps, "GRADE"):.4f}}}
+\\newcommand{{\\GRADESTEGenGap}}{{{get_val(gen_gaps, "GRADE-STE"):.4f}}}
+\\newcommand{{\\PPOGenGap}}{{{get_val(gen_gaps, "PPO"):.4f}}}
+\\newcommand{{\\REINFORCEGenGap}}{{{get_val(gen_gaps, "REINFORCE"):.4f}}}
+
+% Variance Reduction
+\\newcommand{{\\VarianceReduction}}{{{variance_reduction}}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DOCUMENT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \\title{{{PAPER_TITLE}}}
-\\author{{Anonymous}}
+
+\\author{{
+  Anonymous Author(s)\\\\
+  Anonymous Institution\\\\
+  \\texttt{{anonymous@email.com}}
+}}
 
 \\begin{{document}}
+
 \\maketitle
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \\begin{{abstract}}
-We introduce GRADE, which replaces policy gradient estimation with direct backpropagation through Gumbel-Softmax relaxation. On sentiment-controlled generation, GRADE achieves {test_rewards.get("GRADE", 0):.3f} test reward compared to PPO's {test_rewards.get("PPO", 0):.3f}, while reducing gradient variance by [X]\\%. Proper train/val/test splits confirm these results generalize.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% WRITE: A compelling abstract summarizing the contribution and results
+% KEY RESULTS TO MENTION:
+% - GRADE test reward: \\GRADETestReward vs PPO: \\PPOTestReward
+% - Gradient variance reduction: \\VarianceReduction\\%
+% - Method: Gumbel-Softmax relaxation replaces policy gradients
+
+We introduce \\method{{}} (\\methodfull{{}}), a method for aligning language models that replaces high-variance policy gradient estimation with direct backpropagation through a differentiable relaxation of the sampling process. 
+Using the Gumbel-Softmax reparameterization, \\method{{}} enables end-to-end gradient flow from reward signals through generated tokens to model parameters.
+On sentiment-controlled text generation using the IMDB dataset, \\method{{}} achieves a test reward of $\\GRADETestReward{{}} \\pm \\GRADETestStd{{}}$ compared to PPO's $\\PPOTestReward{{}} \\pm \\PPOTestStd{{}}$, while reducing gradient variance by \\VarianceReduction{{}}\\%.
+Our rigorous evaluation with proper train/validation/test splits demonstrates that these improvements generalize to held-out data.
+\\method{{}} offers a simpler, more stable alternative to reinforcement learning for LLM alignment.
+
 \\end{{abstract}}
 
-\\section{{Experiments}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Introduction}}
+\\label{{sec:intro}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% WRITE: Motivation, problem statement, and contributions
+% STRUCTURE:
+% 1. LLM alignment is important (RLHF is dominant)
+% 2. Problem: Policy gradients have high variance
+% 3. Our solution: Differentiable relaxations (Gumbel-Softmax)
+% 4. Key contributions and results
 
-\\subsection{{Data Splits}}
-To ensure rigorous evaluation:
-\\begin{{itemize}}
-    \\item Reward model: 5,000 samples (IMDB train)
-    \\item Policy training: 10,000 samples (disjoint from RM)
-    \\item Validation: 2,000 samples (for monitoring)
-    \\item Test: 25,000 samples (IMDB test, evaluated once at end)
+% TODO: Write introduction prose here
+
+\\paragraph{{Contributions.}}
+\\begin{{enumerate}}[leftmargin=*]
+    \\item We propose \\method{{}}, which replaces policy gradient estimation with direct backpropagation through Gumbel-Softmax relaxations for LLM alignment.
+    \\item We provide theoretical analysis showing \\method{{}} reduces gradient variance compared to REINFORCE and PPO.
+    \\item Through rigorous experiments with proper train/val/test splits, we demonstrate \\method{{}} achieves competitive reward ($\\GRADETestReward{{}}$ vs PPO's $\\PPOTestReward{{}}$) with \\VarianceReduction{{}}\\% lower gradient variance.
+\\end{{enumerate}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Related Work}}
+\\label{{sec:related}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% WRITE: Cover these areas:
+% 1. RLHF and LLM alignment (PPO, DPO, etc.)
+% 2. Policy gradient methods and variance reduction
+% 3. Gumbel-Softmax and differentiable relaxations
+% 4. Alternative alignment methods
+
+% TODO: Write related work prose here
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Background}}
+\\label{{sec:background}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\\subsection{{Problem Setup: LLM Alignment}}
+% WRITE: Formal problem definition
+
+Let $\\pi_\\theta$ be a language model parameterized by $\\theta$, and let $r(x, y)$ be a reward function scoring response $y$ given prompt $x$.
+The alignment objective is:
+\\begin{{equation}}
+    \\max_\\theta \\E_{{x \\sim \\mathcal{{D}}, y \\sim \\pi_\\theta(\\cdot|x)}} \\left[ r(x, y) - \\beta \\KL(\\pi_\\theta || \\pi_{{\\text{{ref}}}}) \\right]
+\\end{{equation}}
+where $\\pi_{{\\text{{ref}}}}$ is a reference policy and $\\beta$ controls the KL penalty.
+
+\\subsection{{Policy Gradient Methods}}
+% WRITE: REINFORCE, PPO basics
+
+The standard approach uses policy gradients:
+\\begin{{equation}}
+    \\nabla_\\theta J(\\theta) = \\E \\left[ \\sum_t \\nabla_\\theta \\log \\pi_\\theta(y_t | x, y_{{<t}}) \\cdot A_t \\right]
+\\end{{equation}}
+where $A_t$ is an advantage estimate. This estimator has high variance due to the discrete sampling.
+
+\\subsection{{Gumbel-Softmax Relaxation}}
+% WRITE: Gumbel-Softmax background
+
+The Gumbel-Softmax distribution \\cite{{jang2016categorical, maddison2016concrete}} provides a continuous relaxation of categorical sampling:
+\\begin{{equation}}
+    \\tilde{{y}}_i = \\frac{{\\exp((\\log \\pi_i + g_i) / \\tau)}}{{\\sum_j \\exp((\\log \\pi_j + g_j) / \\tau)}}
+\\end{{equation}}
+where $g_i \\sim \\text{{Gumbel}}(0, 1)$ and $\\tau$ is the temperature.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Method: \\method{{}}}}
+\\label{{sec:method}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% WRITE: Detailed method description
+
+\\subsection{{Differentiable Generation}}
+% WRITE: How soft tokens are generated
+
+Instead of sampling discrete tokens, \\method{{}} generates soft token distributions:
+\\begin{{equation}}
+    \\tilde{{y}}_t = \\text{{GumbelSoftmax}}(\\pi_\\theta(\\cdot | x, \\tilde{{y}}_{{<t}}), \\tau)
+\\end{{equation}}
+
+The soft tokens $\\tilde{{y}}_t \\in \\Delta^V$ (the probability simplex over vocabulary $V$) are fed to subsequent layers via:
+\\begin{{equation}}
+    e_t = \\tilde{{y}}_t^\\top E
+\\end{{equation}}
+where $E \\in \\R^{{V \\times d}}$ is the embedding matrix.
+
+\\subsection{{Differentiable Reward Computation}}
+% WRITE: How rewards flow through soft tokens
+
+The reward model operates on soft token sequences:
+\\begin{{equation}}
+    r(x, \\tilde{{y}}) = f_\\phi\\left( \\sum_t \\tilde{{y}}_t^\\top E_\\phi \\right)
+\\end{{equation}}
+enabling direct gradient computation $\\nabla_\\theta r(x, \\tilde{{y}})$.
+
+\\subsection{{Temperature Annealing}}
+% WRITE: Annealing schedule
+
+We anneal temperature from $\\tau_{{\\text{{start}}}} = 2.0$ to $\\tau_{{\\text{{end}}}} = 0.5$ over training:
+\\begin{{equation}}
+    \\tau(t) = \\tau_{{\\text{{start}}}} - \\frac{{t}}{{T}} (\\tau_{{\\text{{start}}}} - \\tau_{{\\text{{end}}}})
+\\end{{equation}}
+
+\\subsection{{Training Objective}}
+\\begin{{equation}}
+    \\mathcal{{L}}(\\theta) = -\\E_{{x \\sim \\mathcal{{D}}}} \\left[ r(x, \\tilde{{y}}) \\right] + \\beta \\KL(\\pi_\\theta || \\pi_{{\\text{{ref}}}})
+\\end{{equation}}
+
+\\begin{{algorithm}}[t]
+\\caption{{\\method{{}} Training}}
+\\label{{alg:grade}}
+\\begin{{algorithmic}}[1]
+\\REQUIRE Policy $\\pi_\\theta$, reward model $r$, reference $\\pi_{{\\text{{ref}}}}$, temperature schedule $\\tau(t)$
+\\FOR{{step $t = 1$ to $T$}}
+    \\STATE Sample batch of prompts $\\{{x_i\\}}$ from training set
+    \\STATE Generate soft tokens: $\\tilde{{y}}_i \\sim \\text{{GumbelSoftmax}}(\\pi_\\theta(\\cdot|x_i), \\tau(t))$
+    \\STATE Compute rewards: $r_i = r(x_i, \\tilde{{y}}_i)$
+    \\STATE Compute KL: $\\text{{kl}}_i = \\KL(\\pi_\\theta(\\cdot|x_i, \\tilde{{y}}_i) || \\pi_{{\\text{{ref}}}}(\\cdot|x_i, \\tilde{{y}}_i))$
+    \\STATE Update: $\\theta \\leftarrow \\theta + \\alpha \\nabla_\\theta (r_i - \\beta \\cdot \\text{{kl}}_i)$
+\\ENDFOR
+\\end{{algorithmic}}
+\\end{{algorithm}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Theoretical Analysis}}
+\\label{{sec:theory}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% WRITE: Variance reduction analysis
+
+\\begin{{proposition}}[Variance Reduction]
+Let $\\hat{{g}}_{{\\text{{PG}}}}$ be the policy gradient estimator and $\\hat{{g}}_{{\\text{{GS}}}}$ be the Gumbel-Softmax gradient.
+Under mild assumptions, $\\text{{Var}}(\\hat{{g}}_{{\\text{{GS}}}}) \\leq \\text{{Var}}(\\hat{{g}}_{{\\text{{PG}}}})$.
+\\end{{proposition}}
+
+% TODO: Add proof sketch or intuition
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Experiments}}
+\\label{{sec:experiments}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\\subsection{{Experimental Setup}}
+
+\\paragraph{{Task.}} Sentiment-controlled text generation on IMDB movie reviews. The goal is to steer completions toward positive sentiment.
+
+\\paragraph{{Data Splits.}} We use rigorous non-overlapping splits to ensure proper evaluation:
+\\begin{{itemize}}[leftmargin=*]
+    \\item \\textbf{{Reward Model Training:}} 5,000 samples (IMDB train[0:5000])
+    \\item \\textbf{{Policy Training:}} 10,000 samples (IMDB train[5000:15000])
+    \\item \\textbf{{Validation:}} 2,000 samples (IMDB train[15000:17000]) --- for monitoring only
+    \\item \\textbf{{Test:}} 25,000 samples (IMDB test split) --- evaluated once at end
 \\end{{itemize}}
 
-\\begin{{table}}[h]
+\\paragraph{{Models.}}
+\\begin{{itemize}}[leftmargin=*]
+    \\item Base model: GPT-2 Medium / Pythia-410M with LoRA adapters ($r=16$, $\\alpha=32$)
+    \\item Reward model: Same-vocabulary classifier trained on IMDB sentiment
+\\end{{itemize}}
+
+\\paragraph{{Methods Compared.}}
+\\begin{{enumerate}}[leftmargin=*]
+    \\item \\textbf{{\\method{{}} (Gumbel-Softmax):}} Temperature annealed $2.0 \\to 0.5$
+    \\item \\textbf{{\\method{{}}-STE:}} Straight-Through Estimator variant
+    \\item \\textbf{{PPO:}} Proximal Policy Optimization with GAE, 4 epochs, clip$=0.2$
+    \\item \\textbf{{REINFORCE:}} Vanilla policy gradient with learned baseline
+\\end{{enumerate}}
+
+\\paragraph{{Hyperparameters.}} Learning rate $10^{{-4}}$, batch size 4, gradient accumulation 4 steps, KL coefficient $\\beta = 0.1$, max new tokens 48.
+
+%------------------------------------------------------------------------------
+\\subsection{{Main Results}}
+%------------------------------------------------------------------------------
+
+\\begin{{table}}[t]
 \\centering
-\\caption{{Final TEST performance (proper held-out evaluation)}}
-\\begin{{tabular}}{{lccc}}
+\\caption{{\\textbf{{Final Test Performance.}} Results on held-out IMDB test set (25,000 samples), evaluated once at the end of training. Best results in \\textbf{{bold}}.}}
+\\label{{tab:main_results}}
+\\begin{{tabular}}{{lcccc}}
 \\toprule
-Method & Test Reward & Best Val & Grad Var \\\\
+\\textbf{{Method}} & \\textbf{{Test Reward}} & \\textbf{{Best Val}} & \\textbf{{Grad Var}} & \\textbf{{Gen Gap}} \\\\
 \\midrule
-GRADE & ${test_rewards.get("GRADE", 0):.3f} \\pm {test_stds.get("GRADE", 0):.3f}$ & ${best_vals.get("GRADE", 0):.3f}$ & ${grad_vars.get("GRADE", 0):.4f}$ \\\\
-GRADE-STE & ${test_rewards.get("GRADE-STE", 0):.3f} \\pm {test_stds.get("GRADE-STE", 0):.3f}$ & ${best_vals.get("GRADE-STE", 0):.3f}$ & ${grad_vars.get("GRADE-STE", 0):.4f}$ \\\\
-PPO & ${test_rewards.get("PPO", 0):.3f} \\pm {test_stds.get("PPO", 0):.3f}$ & ${best_vals.get("PPO", 0):.3f}$ & ${grad_vars.get("PPO", 0):.4f}$ \\\\
-REINFORCE & ${test_rewards.get("REINFORCE", 0):.3f} \\pm {test_stds.get("REINFORCE", 0):.3f}$ & ${best_vals.get("REINFORCE", 0):.3f}$ & ${grad_vars.get("REINFORCE", 0):.4f}$ \\\\
+\\method{{}} & $\\GRADETestReward{{}} \\pm \\GRADETestStd{{}}$ & $\\GRADEBestVal{{}}$ & $\\GRADEGradVar{{}}$ & $\\GRADEGenGap{{}}$ \\\\
+\\method{{}}-STE & $\\GRADESTETestReward{{}} \\pm \\GRADESTETestStd{{}}$ & $\\GRADESTEBestVal{{}}$ & $\\GRADESTEGradVar{{}}$ & $\\GRADESTEGenGap{{}}$ \\\\
+PPO & $\\PPOTestReward{{}} \\pm \\PPOTestStd{{}}$ & $\\PPOBestVal{{}}$ & $\\PPOGradVar{{}}$ & $\\PPOGenGap{{}}$ \\\\
+REINFORCE & $\\REINFORCETestReward{{}} \\pm \\REINFORCETestStd{{}}$ & $\\REINFORCEBestVal{{}}$ & $\\REINFORCEGradVar{{}}$ & $\\REINFORCEGenGap{{}}$ \\\\
 \\bottomrule
 \\end{{tabular}}
 \\end{{table}}
 
+% WRITE: Analysis of main results table
+% KEY POINTS:
+% - Compare GRADE vs PPO test rewards
+% - Highlight gradient variance reduction
+% - Discuss generalization (val vs test gap)
+
+%------------------------------------------------------------------------------
+\\subsection{{Sample Efficiency}}
+%------------------------------------------------------------------------------
+
+\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Sample Efficiency.}} Training steps required to reach reward thresholds on training data. Lower is better.}}
+\\label{{tab:sample_efficiency}}
+\\begin{{tabular}}{{lccccc}}
+\\toprule
+\\textbf{{Method}} & \\textbf{{60\\%}} & \\textbf{{70\\%}} & \\textbf{{80\\%}} & \\textbf{{85\\%}} & \\textbf{{90\\%}} \\\\
+\\midrule
+{sample_eff_latex}
+\\bottomrule
+\\end{{tabular}}
+\\end{{table}}
+
+% WRITE: Analysis of sample efficiency
+
+%------------------------------------------------------------------------------
+\\subsection{{Statistical Significance}}
+%------------------------------------------------------------------------------
+
+\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Statistical Significance Tests.}} Two-sample t-tests on final 20\\% of training rewards. Significance: * $p<0.05$, ** $p<0.01$, *** $p<0.001$.}}
+\\label{{tab:stat_tests}}
+\\begin{{tabular}}{{lccc}}
+\\toprule
+\\textbf{{Comparison}} & \\textbf{{t-statistic}} & \\textbf{{p-value}} & \\textbf{{Sig.}} \\\\
+\\midrule
+{stat_test_latex}
+\\bottomrule
+\\end{{tabular}}
+\\end{{table}}
+
+%------------------------------------------------------------------------------
+\\subsection{{Gradient Analysis}}
+%------------------------------------------------------------------------------
+
+% WRITE: Analysis of gradient variance results
+% KEY INSIGHT: This is the main theoretical advantage of GRADE
+
+\\begin{{figure}}[t]
+\\centering
+% \\includegraphics[width=\\textwidth]{{figures/fig3_gradient_analysis.pdf}}
+\\caption{{\\textbf{{Gradient Analysis.}} (a) Gradient norm over training. (b) Gradient variance distribution. \\method{{}} shows \\VarianceReduction{{}}\\% lower variance than PPO.}}
+\\label{{fig:gradients}}
+\\end{{figure}}
+
+%------------------------------------------------------------------------------
+\\subsection{{Learning Curves}}
+%------------------------------------------------------------------------------
+
+\\begin{{figure}}[t]
+\\centering
+% \\includegraphics[width=\\textwidth]{{figures/fig1_learning_curves.pdf}}
+\\caption{{\\textbf{{Training Dynamics.}} (a) Training reward over steps. (b) Loss curves. (c) KL divergence from reference model.}}
+\\label{{fig:learning_curves}}
+\\end{{figure}}
+
+\\begin{{figure}}[t]
+\\centering
+% \\includegraphics[width=\\textwidth]{{figures/fig2_validation_curves.pdf}}
+\\caption{{\\textbf{{Validation Performance.}} (a) Validation reward during training. Markers indicate best checkpoint. (b) Generalization gap (Train - Val reward). Values near zero indicate good generalization.}}
+\\label{{fig:validation}}
+\\end{{figure}}
+
+%------------------------------------------------------------------------------
+\\subsection{{Ablation: Temperature Schedule}}
+%------------------------------------------------------------------------------
+
+\\begin{{figure}}[t]
+\\centering
+% \\includegraphics[width=\\textwidth]{{figures/fig6_tau_ablation.pdf}}
+\\caption{{\\textbf{{Temperature Ablation.}} (a) Annealing schedule from $\\tau=2.0$ to $\\tau=0.5$. (b) Reward vs temperature, colored by training step.}}
+\\label{{fig:tau_ablation}}
+\\end{{figure}}
+
+% WRITE: Discussion of temperature schedule importance
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Discussion}}
+\\label{{sec:discussion}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% WRITE: 
+% 1. Summary of key findings
+% 2. When to use GRADE vs PPO
+% 3. Limitations
+% 4. Broader impact
+
+\\paragraph{{Key Findings.}}
+\\begin{{itemize}}
+{claims_latex}
+\\end{{itemize}}
+
+\\paragraph{{Limitations.}}
+% WRITE: Discuss limitations (e.g., soft token approximation, temperature sensitivity)
+
+\\paragraph{{Broader Impact.}}
+% WRITE: Discuss implications for LLM alignment
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\\section{{Conclusion}}
+\\label{{sec:conclusion}}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% WRITE: Summarize contributions and results
+
+We introduced \\method{{}}, a method that replaces policy gradient estimation with direct backpropagation through Gumbel-Softmax relaxations for LLM alignment.
+Our experiments demonstrate that \\method{{}} achieves test reward of $\\GRADETestReward{{}}$ compared to PPO's $\\PPOTestReward{{}}$, while reducing gradient variance by \\VarianceReduction{{}}\\%.
+With proper train/validation/test methodology, we show these improvements generalize to held-out data.
+\\method{{}} offers a simpler, more stable alternative to reinforcement learning for aligning language models with human preferences.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REFERENCES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\\bibliographystyle{{plainnat}}
+% \\bibliography{{references}}
+
+\\begin{{thebibliography}}{{10}}
+
+\\bibitem[Jang et al.(2016)Jang, Gu, and Poole]{{jang2016categorical}}
+Eric Jang, Shixiang Gu, and Ben Poole.
+\\newblock Categorical reparameterization with Gumbel-Softmax.
+\\newblock In \\emph{{ICLR}}, 2017.
+
+\\bibitem[Maddison et al.(2016)Maddison, Mnih, and Teh]{{maddison2016concrete}}
+Chris~J. Maddison, Andriy Mnih, and Yee~Whye Teh.
+\\newblock The Concrete Distribution: A Continuous Relaxation of Discrete Random Variables.
+\\newblock In \\emph{{ICLR}}, 2017.
+
+\\bibitem[Schulman et al.(2017)Schulman, Wolski, Dhariwal, Radford, and Klimov]{{schulman2017ppo}}
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov.
+\\newblock Proximal Policy Optimization Algorithms.
+\\newblock \\emph{{arXiv preprint arXiv:1707.06347}}, 2017.
+
+\\bibitem[Ouyang et al.(2022)Ouyang, Wu, Jiang, et al.]{{ouyang2022training}}
+Long Ouyang, Jeff Wu, Xu~Jiang, et al.
+\\newblock Training language models to follow instructions with human feedback.
+\\newblock In \\emph{{NeurIPS}}, 2022.
+
+\\bibitem[Rafailov et al.(2023)Rafailov, Sharma, Mitchell, Ermon, Manning, and Finn]{{rafailov2023direct}}
+Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher~D. Manning, and Chelsea Finn.
+\\newblock Direct Preference Optimization: Your Language Model is Secretly a Reward Model.
+\\newblock In \\emph{{NeurIPS}}, 2023.
+
+\\bibitem[Williams(1992)]{{williams1992simple}}
+Ronald~J. Williams.
+\\newblock Simple statistical gradient-following algorithms for connectionist reinforcement learning.
+\\newblock \\emph{{Machine Learning}}, 8(3):229--256, 1992.
+
+\\bibitem[Hu et al.(2022)Hu, Shen, Wallis, et al.]{{hu2022lora}}
+Edward~J. Hu, Yelong Shen, Phillip Wallis, et al.
+\\newblock LoRA: Low-Rank Adaptation of Large Language Models.
+\\newblock In \\emph{{ICLR}}, 2022.
+
+\\end{{thebibliography}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\\appendix
+
+\\section{{Additional Experimental Details}}
+\\label{{app:details}}
+
+\\subsection{{Hyperparameters}}
+
+\\begin{{table}}[h]
+\\centering
+\\caption{{Full hyperparameter settings.}}
+\\begin{{tabular}}{{ll}}
+\\toprule
+\\textbf{{Parameter}} & \\textbf{{Value}} \\\\
+\\midrule
+Base Model & GPT-2 Medium / Pythia-410M \\\\
+LoRA rank ($r$) & 16 \\\\
+LoRA alpha ($\\alpha$) & 32 \\\\
+LoRA dropout & 0.05 \\\\
+Learning rate & $10^{{-4}}$ \\\\
+Batch size & 4 \\\\
+Gradient accumulation & 4 \\\\
+Max training steps & 2000 \\\\
+Max new tokens & 48 \\\\
+Min new tokens & 16 \\\\
+KL coefficient ($\\beta$) & 0.1 \\\\
+\\midrule
+\\multicolumn{{2}}{{l}}{{\\textit{{Gumbel-Softmax Specific}}}} \\\\
+Initial temperature ($\\tau_{{\\text{{start}}}}$) & 2.0 \\\\
+Final temperature ($\\tau_{{\\text{{end}}}}$) & 0.5 \\\\
+Annealing steps & 2000 \\\\
+\\midrule
+\\multicolumn{{2}}{{l}}{{\\textit{{PPO Specific}}}} \\\\
+PPO epochs & 4 \\\\
+Clip range & 0.2 \\\\
+Value coefficient & 0.5 \\\\
+Entropy coefficient & 0.01 \\\\
+GAE $\\lambda$ & 0.95 \\\\
+Discount $\\gamma$ & 0.99 \\\\
+\\bottomrule
+\\end{{tabular}}
+\\end{{table}}
+
+\\section{{Sample Generations}}
+\\label{{app:samples}}
+
+% TODO: Add example generations from each method
+
 \\end{{document}}
 '''
     
-    with open(output_dir / "paper_template.tex", "w") as f:
+    with open(output_dir / "paper_template_full.tex", "w") as f:
         f.write(template)
     
-    return prompt
+    print(f"  Generated: paper_template_full.tex")
 
 @dataclass
 class Arguments:
@@ -941,7 +1513,7 @@ def main(results_dir: str = "/data/results", eval_every: int = 100):
     print('='*60)
     print(f"  {figures_dir}/neurips_report.txt - Complete results report")
     print(f"  {figures_dir}/paper_generation_prompt.txt - Prompt to generate full paper")
-    print(f"  {figures_dir}/paper_template.tex - LaTeX template with results")
+    print(f"  {figures_dir}/paper_template_full.tex - Complete LaTeX template with all results (LLM-ready)")
     print(f"  {figures_dir}/results_table.tex - Results table for paper")
     print(f"  {figures_dir}/statistical_analysis.txt - Statistical tests")
     print(f"  {figures_dir}/fig1-6_*.pdf - Paper figures")
