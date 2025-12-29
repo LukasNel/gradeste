@@ -1,0 +1,149 @@
+You are an expert ML researcher writing a NeurIPS paper. Write a complete, publication-ready paper based on the experimental results below.
+
+# PAPER TOPIC
+Differentiable Relaxations as an Alternative to Policy Gradient Methods for LLM Alignment
+
+# EXPERIMENTAL SETUP
+
+## Data Splits (Proper Train/Val/Test)
+- Reward Model Training: 5,000 samples (IMDB train[0:5000])
+- Policy Training: 10,000 samples (IMDB train[5000:15000])  
+- Validation: 2,000 samples (IMDB train[15000:17000]) - used for monitoring during training
+- Test: 25,000 samples (IMDB test split) - evaluated ONLY at the end
+
+## Models
+- Base model: GPT-2 Medium (or Pythia-410M) with LoRA adapters (r=16, alpha=32)
+- Reward model: Same-vocab classifier trained on IMDB sentiment
+- Task: Steer generations toward positive sentiment
+
+## Methods Compared
+1. **GRADE (Gumbel-Softmax)**: Differentiable relaxation, temperature annealed 2.0 → 0.5
+2. **GRADE-STE**: Straight-Through Estimator variant
+3. **PPO**: Proximal Policy Optimization with GAE, 4 epochs, clip=0.2
+4. **REINFORCE**: Vanilla policy gradient with learned baseline
+
+# EXPERIMENTAL RESULTS
+
+## Final TEST Performance (mean ± std)
+{
+  "GRADE": 0.5898229504313204,
+  "PPO": 0.5104104777167376,
+  "REINFORCE": 0.6173225556457037,
+  "GRADE-STE": 0.7626937252734497
+}
+
+Standard deviations:
+{
+  "GRADE": 0.39280379144188005,
+  "PPO": 0.3126669486806951,
+  "REINFORCE": 0.3778516740969312,
+  "GRADE-STE": 0.34383794640053067
+}
+
+## Best Validation Performance
+{
+  "GRADE": 0.5870330390128947,
+  "PPO": 0.5729786024334317,
+  "REINFORCE": 0.6543011823351844,
+  "GRADE-STE": 0.6857167674863013
+}
+
+## Generalization Gap (Best Val - Test, lower is better)
+{
+  "GRADE": -0.0028,
+  "PPO": 0.0626,
+  "REINFORCE": 0.037,
+  "GRADE-STE": -0.077
+}
+
+## Gradient Variance
+{
+  "GRADE": 68.43615854378395,
+  "REINFORCE": 0.04971270996468205,
+  "GRADE-STE": 0.0033958851435225944
+}
+
+## Sample Efficiency (training steps to reach threshold)
+{
+  "GRADE": {
+    "60%": null,
+    "70%": null,
+    "80%": null,
+    "85%": null,
+    "90%": null
+  },
+  "PPO": {
+    "60%": 0,
+    "70%": 0,
+    "80%": 0,
+    "85%": 0,
+    "90%": null
+  },
+  "REINFORCE": {
+    "60%": null,
+    "70%": null,
+    "80%": null,
+    "85%": null,
+    "90%": null
+  },
+  "GRADE-STE": {
+    "60%": 90,
+    "70%": 145,
+    "80%": null,
+    "85%": null,
+    "90%": null
+  }
+}
+
+## Statistical Significance Tests
+[
+  {
+    "comparison": "GRADE vs PPO",
+    "t_statistic": -4.822439383199515,
+    "p_value": 5.196639879465554e-06,
+    "significant": true
+  },
+  {
+    "comparison": "GRADE vs REINFORCE",
+    "t_statistic": -5.65845585043057,
+    "p_value": 1.5170179623341993e-07,
+    "significant": true
+  },
+  {
+    "comparison": "GRADE vs GRADE-STE",
+    "t_statistic": -8.610480518867536,
+    "p_value": 1.2427689573828153e-13,
+    "significant": true
+  },
+  {
+    "comparison": "PPO vs REINFORCE",
+    "t_statistic": -0.4638888955981837,
+    "p_value": 0.6437561092962935,
+    "significant": false
+  },
+  {
+    "comparison": "PPO vs GRADE-STE",
+    "t_statistic": -4.365821522425956,
+    "p_value": 3.142715673124498e-05,
+    "significant": true
+  },
+  {
+    "comparison": "REINFORCE vs GRADE-STE",
+    "t_statistic": -4.085955830308561,
+    "p_value": 8.984796191738489e-05,
+    "significant": true
+  }
+]
+
+# KEY CLAIMS SUPPORTED BY DATA
+- GRADE achieves comparable TEST reward to PPO
+
+# FIGURES AVAILABLE
+- Figure 1: Training curves (reward, loss, KL)
+- Figure 2: Validation curves & generalization gap
+- Figure 3: Gradient analysis (norms, variance box plot)
+- Figure 4: Sample efficiency
+- Figure 5: Final TEST comparison & val vs test
+- Figure 6: Temperature ablation
+
+Now write the complete NeurIPS paper with proper train/val/test methodology emphasized.

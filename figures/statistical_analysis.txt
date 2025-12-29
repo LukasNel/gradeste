@@ -1,0 +1,80 @@
+============================================================
+STATISTICAL ANALYSIS
+============================================================
+
+## Final TEST Reward Comparison (t-tests on last 20% of training)
+
+GRADE vs PPO:
+  t-statistic: -4.8224
+  p-value: 0.000005
+  Significant (p<0.05): Yes
+
+GRADE vs REINFORCE:
+  t-statistic: -5.6585
+  p-value: 0.000000
+  Significant (p<0.05): Yes
+
+GRADE vs GRADE-STE:
+  t-statistic: -8.6105
+  p-value: 0.000000
+  Significant (p<0.05): Yes
+
+PPO vs REINFORCE:
+  t-statistic: -0.4639
+  p-value: 0.643756
+  Significant (p<0.05): No
+
+PPO vs GRADE-STE:
+  t-statistic: -4.3658
+  p-value: 0.000031
+  Significant (p<0.05): Yes
+
+REINFORCE vs GRADE-STE:
+  t-statistic: -4.0860
+  p-value: 0.000090
+  Significant (p<0.05): Yes
+
+## Generalization Analysis (Best Val vs Test)
+
+GRADE:
+  Best Validation: 0.5870
+  Test Reward: 0.5898
+  Gap (Val - Test): -0.0028 (good generalization)
+
+PPO:
+  Best Validation: 0.5730
+  Test Reward: 0.5104
+  Gap (Val - Test): 0.0626 (overfitting)
+
+REINFORCE:
+  Best Validation: 0.6543
+  Test Reward: 0.6173
+  Gap (Val - Test): 0.0370 (good generalization)
+
+GRADE-STE:
+  Best Validation: 0.6857
+  Test Reward: 0.7627
+  Gap (Val - Test): -0.0770 (good generalization)
+
+## Gradient Variance Analysis
+
+GRADE:
+  Mean grad std: 68.4362
+  Median grad std: 0.2956
+  Max grad std: 10583.8204
+
+REINFORCE:
+  Mean grad std: 0.0497
+  Median grad std: 0.0479
+  Max grad std: 0.1680
+
+GRADE-STE:
+  Mean grad std: 0.0034
+  Median grad std: 0.0027
+  Max grad std: 0.0229
+
+## Sample Efficiency (steps to 0.8 training reward)
+  GRADE: Did not reach 0.8
+  PPO: 0 steps
+  REINFORCE: Did not reach 0.8
+  GRADE-STE: Did not reach 0.8
